@@ -1,106 +1,164 @@
-import java.time.LocalDateTime;
-import java.util.UUID;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
-// Reservation (immutable request object)
+// Reservation (same as before, simplified here)
 class Reservation {
     private final String requestId;
     private final String guestName;
     private final String roomType;
-    private final LocalDateTime requestTime;
 
-    public Reservation(String guestName, String roomType) {
-        this.requestId = UUID.randomUUID().toString();
+    public Reservation(String requestId, String guestName, String roomType) {
+        this.requestId = requestId;
         this.guestName = guestName;
         this.roomType = roomType;
-        this.requestTime = LocalDateTime.now();
     }
 
-    public String getRequestId() {
-        return requestId;
-    }
+    public String getRequestId() { return requestId; }
+    public String getGuestName() { return guestName; }
+    public String getRoomType() { return roomType; }
+}
 
-    public String getGuestName() {
-        return guestName;
-    }
+// Confirmed booking
+class ConfirmedReservation {
+    private final String requestId;
+    private final String guestName;
+    private final String roomType;
+    private final String roomId;
 
-    public String getRoomType() {
-        return roomType;
-    }
-
-    public LocalDateTime getRequestTime() {
-        return requestTime;
+    public ConfirmedReservation(String requestId, String guestName, String roomType, String roomId) {
+        this.requestId = requestId;
+        this.guestName = guestName;
+        this.roomType = roomType;
+        this.roomId = roomId;
     }
 
     @Override
     public String toString() {
-        return "Reservation{" +
-                "requestId='" + requestId + '\'' +
-                ", guestName='" + guestName + '\'' +
-                ", roomType='" + roomType + '\'' +
-                ", requestTime=" + requestTime +
-                '}';
+        return "CONFIRMED -> " + guestName +
+                " | RoomType: " + roomType +
+                " | RoomId: " + roomId;
     }
 }
 
-// Booking Request Queue (FIFO + thread-safe)
+// Inventory Service (critical section)
+class InventoryService {
+
+    // roomType -> available count
+    private final Map<String, AtomicInteger> availability = new ConcurrentHashMap<>();
+
+    // roomType -> allocated room IDs
+    private final Map<String, Set<String>> allocatedRooms = new ConcurrentHashMap<>();
+
+    public InventoryService(Map<String, Integer> initialInventory) {
+        initialInventory.forEach((type, count) -> {
+            availability.put(type, new AtomicInteger(count));
+            allocatedRooms.put(type, ConcurrentHashMap.newKeySet());
+        });
+    }
+
+    // Atomic allocation method (core logic)
+    public synchronized Optional<String> allocateRoom(String roomType) {
+        AtomicInteger count = availability.get(roomType);
+
+        if (count == null || count.get() <= 0) {
+            return Optional.empty();
+        }
+
+        // Generate unique room ID
+        String roomId = UUID.randomUUID().toString();
+
+        // Record allocation
+        allocatedRooms.get(roomType).add(roomId);
+
+        // Decrement inventory
+        count.decrementAndGet();
+
+        return Optional.of(roomId);
+    }
+}
+
+// Booking Request Queue
 class BookingRequestQueue {
     private final BlockingQueue<Reservation> queue = new LinkedBlockingQueue<>();
 
-    // Add request (producer)
-    public void addRequest(Reservation reservation) {
-        queue.offer(reservation); // non-blocking add
-        System.out.println("Request added to queue: " + reservation.getRequestId());
+    public void add(Reservation r) {
+        queue.offer(r);
     }
 
-    // Peek (for monitoring, no removal)
-    public Reservation peek() {
-        return queue.peek();
-    }
-
-    // Poll (used later by allocation system)
-    public Reservation poll() {
-        return queue.poll();
-    }
-
-    public int size() {
-        return queue.size();
+    public Reservation take() throws InterruptedException {
+        return queue.take(); // waits if empty
     }
 }
 
-// Booking Service (intake layer)
-class BookingService {
-    private final BookingRequestQueue requestQueue;
+// Booking Service (consumer/processor)
+class BookingService implements Runnable {
 
-    public BookingService(BookingRequestQueue requestQueue) {
-        this.requestQueue = requestQueue;
+    private final BookingRequestQueue queue;
+    private final InventoryService inventoryService;
+
+    public BookingService(BookingRequestQueue queue, InventoryService inventoryService) {
+        this.queue = queue;
+        this.inventoryService = inventoryService;
     }
 
-    // Guest submits request
-    public void submitRequest(String guestName, String roomType) {
-        Reservation reservation = new Reservation(guestName, roomType);
-        requestQueue.addRequest(reservation);
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                Reservation request = queue.take();
+
+                System.out.println("Processing request: " + request.getRequestId());
+
+                Optional<String> roomIdOpt =
+                        inventoryService.allocateRoom(request.getRoomType());
+
+                if (roomIdOpt.isPresent()) {
+                    ConfirmedReservation confirmed =
+                            new ConfirmedReservation(
+                                    request.getRequestId(),
+                                    request.getGuestName(),
+                                    request.getRoomType(),
+                                    roomIdOpt.get()
+                            );
+
+                    System.out.println(confirmed);
+                } else {
+                    System.out.println("FAILED -> No rooms available for "
+                            + request.getRoomType());
+                }
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
     }
 }
 
 // Demo
 public class BookMyStayApp {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
 
+        // Initial inventory
+        Map<String, Integer> inventory = new HashMap<>();
+        inventory.put("Single", 2);
+        inventory.put("Double", 1);
+
+        InventoryService inventoryService = new InventoryService(inventory);
         BookingRequestQueue queue = new BookingRequestQueue();
-        BookingService bookingService = new BookingService(queue);
 
-        // Simulating multiple guest requests
-        bookingService.submitRequest("Alice", "Single");
-        bookingService.submitRequest("Bob", "Double");
-        bookingService.submitRequest("Charlie", "Suite");
+        // Start booking processor thread
+        Thread worker = new Thread(new BookingService(queue, inventoryService));
+        worker.start();
 
-        System.out.println("\nCurrent Queue Size: " + queue.size());
+        // Simulate incoming requests
+        queue.add(new Reservation("1", "Alice", "Single"));
+        queue.add(new Reservation("2", "Bob", "Single"));
+        queue.add(new Reservation("3", "Charlie", "Single")); // should fail
+        queue.add(new Reservation("4", "David", "Double"));
 
-        System.out.println("\nNext request to process (peek):");
-        System.out.println(queue.peek());
-
-        // NOTE: No inventory changes happen here
+        Thread.sleep(2000);
+        worker.interrupt();
     }
 }
